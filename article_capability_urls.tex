@@ -1,0 +1,513 @@
+% SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+% SPDX-FileCopyrightText: 2026 Polina Lemenkova
+% SPDX-License-Identifier: CC-BY-4.0
+%
+% This paper (text and figures) is licensed under CC-BY-4.0.
+% The reference implementation (mcp-sandbox) and the measurement harness are
+% separately licensed under Apache-2.0.
+
+%% article_capability_urls.tex
+%% Engineering note for arXiv/Zenodo. Compile: pdflatex x2 (inline thebibliography, no bibtex).
+%% Source kept ASCII (see the skill's ASCII discipline); no non-ASCII inside lstlisting.
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\graphicspath{{figures/}{./}}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[numbers]{natbib}
+\usepackage[hidelinks]{hyperref}
+\IfFileExists{hyperxmp.sty}{\usepackage{hyperxmp}}{} % optional: embeds CC license as PDF/XMP rights
+
+\hypersetup{
+  pdftitle={Return by Reference: Bounding Tool-Output Context Cost in LLM Agents with Capability URLs},
+  pdfauthor={Peter Lemenkov},
+  pdfsubject={Bounding tool-output context cost in LLM agents by returning tool outputs by reference. Licensed under CC-BY-4.0.},
+  pdfkeywords={LLM agents, Model Context Protocol, MCP, tool outputs, context management, capability URL, Claim Check pattern, tokenization, prompt injection},
+}
+% Rich XMP rights metadata (dc:rights / cc:license), only when hyperxmp is present:
+\IfFileExists{hyperxmp.sty}{%
+  \hypersetup{%
+    pdfcopyright={Copyright (C) 2026 Peter Lemenkov and Polina Lemenkova. Licensed under CC-BY-4.0.},%
+    pdflicenseurl={https://creativecommons.org/licenses/by/4.0/}%
+  }%
+}{}
+
+\lstdefinestyle{py}{language=Python,basicstyle=\small\ttfamily,
+  keywordstyle=\color{blue!60!black},commentstyle=\color{gray!80!black},
+  stringstyle=\color{green!45!black},showstringspaces=false,
+  numbers=left,numberstyle=\tiny\color{gray},frame=single,
+  breaklines=true,columns=fullflexible}
+\lstdefinestyle{code}{basicstyle=\small\ttfamily,showstringspaces=false,
+  frame=single,breaklines=true,columns=fullflexible,commentstyle=\color{gray!80!black}}
+
+\newcommand{\bref}{by reference}
+
+\title{Return by Reference: Bounding Tool-Output Context Cost\\
+in LLM Agents with Capability URLs}
+\author{Peter Lemenkov\thanks{Independent Researcher, Brno, Czech Republic.
+\texttt{lemenkov@gmail.com}}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+LLM agents increasingly invoke tools that produce large or binary outputs --- figures, PDFs, data files. Tool results commonly return these inline as base64 --- the default afforded by the content model of protocols like the Model Context Protocol (MCP) --- which permanently inflates the agent's context. We measure this cost: base64-encoded binary consumes ${\sim}930$ tokens per KB under a representative BPE tokenizer, so a single 30~KB figure costs ${\sim}27{,}000$ tokens, and a twelve-figure session costs ${\sim}332{,}000$ tokens --- enough to overflow a 200K context window on its own. We describe a preventive alternative: return the output \emph{\bref{}} --- a URI plus fixed-size metadata (size, MIME type, integrity hash) --- and fetch the bytes on demand only when needed. The URI's scheme selects the delivery mechanism; our measured instantiation is a short-lived HTTPS capability URL. This realizes the decades-old \emph{Claim Check} integration pattern --- the claim check is a URI --- and yields \textbf{Bounded Output Context Cost}: the context cost of a tool output is $O(1)$ in its payload size (${\sim}90$--$100$ tokens, measured, independent of file size), a $301\times$ reduction for a typical figure. We give a hardened reference implementation with an MCP-specific security analysis, and position the approach as complementary to observation-masking and summarization (which act reactively and lossily \emph{after} outputs enter context) and orthogonal to input-side tool-advertisement reduction. Reference implementation open-sourced.
+\end{abstract}
+
+\section{Introduction}\label{sec:intro}
+
+LLM agents operate in an iterative loop: the model reasons, invokes a tool, receives the tool's output as an observation, and appends that observation to its context before the next turn. This loop is what makes agents capable, but it also makes their context grow monotonically, and tool observations are the dominant term in that growth. In software-engineering agents, environment observations account for roughly 84\% of the tokens in an average turn~\citep{complexitytrap}. Managing observation tokens is therefore not a micro-optimization but a first-order constraint on how far an agent can get before it runs out of room.
+
+Among observations, the most expensive are binary artifacts: rendered figures, PDFs, plots, image crops, serialized data files. In ecosystems such as the Model Context Protocol (MCP), binary content is commonly returned inline, base64-encoded, as part of the tool result: the image and blob content types carry the bytes as an inline base64 field, making this the path of least resistance for a tool that emits a figure or file. Base64 inflates the byte count by about a third, and the resulting high-entropy string tokenizes poorly. Worse, the cost is not paid once and released: the blob remains resident in the running context, is re-processed on every subsequent model call until it is evicted, survives summarization (a summarizer either faithfully preserves a reference to a multi-thousand-token blob or discards the artifact wholesale), and persists in any logged or replayed transcript.
+
+The scale is easy to underestimate. As we measure in Section~\ref{sec:eval}, a single 30~KB figure costs about 27{,}000 tokens when returned inline; a routine twelve-figure session --- a manuscript figure pass, a data-analysis notebook --- costs about 332{,}000 tokens, which alone exceeds a 200K-token context window. The agent runs out of room not because the task is large, but because its own rendered outputs are sitting in the transcript as base64.
+
+Existing agent context-management work addresses this \emph{reactively}. It either \textbf{masks} observations, replacing older ones with a placeholder~\citep{sweagent}, or \textbf{summarizes} them, condensing history into a running summary~\citep{openhands}. Both help, and a recent systematic comparison finds masking as effective as summarization at lower cost~\citep{complexitytrap}. But both act \emph{after} the observation has already entered context, both are \emph{lossy} (masking discards; summarization compresses and costs an extra model call), and neither prevents the ingestion cost in the first place.
+
+We argue for a different move for a specific class of outputs. A rendered figure, a generated PDF, a large binary that the model does not need to reason over token-by-token, should never enter the model's context at all. Instead, the tool stages the bytes out-of-band and returns a URI plus fixed-size metadata --- name, size, content hash, MIME type, expiry. The client retrieves the bytes on demand, only if a later step actually needs them; in the common case, where the artifact is produced for a human to view, the bytes never re-enter the model's context. This is the \textbf{Claim Check} enterprise-integration pattern~\citep{claimcheck}: the claim check is a URI, and the URI's scheme selects how the bytes are retrieved. Our measured instantiation is a short-lived capability URL over HTTPS~\citep{capurls}; a co-located deployment can instead return a \texttt{file://} URI or an in-protocol resource-link URI (Section~\ref{sec:pattern}). Figure~\ref{fig:inline-vs-reference} contrasts the two schemes on a single 31~KB figure.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{fig01_inline_vs_reference}
+  \caption{Inline base64 (status quo) versus output by reference (this work).
+    (a)~Inlining base64 makes the context cost linear in payload size; the
+    encoded artifact stays resident and is re-processed every turn.
+    (b)~Returning a compact metadata record and staging the bytes out of band
+    keeps the context cost fixed ($\sim$92 tokens), a $301\times$ reduction for
+    a 31~KB figure.}
+  \label{fig:inline-vs-reference}
+\end{figure}
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item We characterize and \textbf{measure} the context cost of inline binary tool outputs, showing it is linear in payload size at ${\sim}930$ tokens/KB and compounds to window-overflowing totals over realistic sessions (Section~\ref{sec:eval}).
+\item We describe the \textbf{output-by-reference} pattern for agent tools and name its defining property, \textbf{Bounded Output Context Cost}: the context cost of a tool output is $O(1)$ in the size of its payload (Section~\ref{sec:pattern}).
+\item We give an MCP-specific \textbf{security model} for the capability-URL mechanism, including its honest bearer-token limitations and stricter variants (Section~\ref{sec:security}).
+\item We provide an open-source \textbf{reference implementation} and measurement harness (Section~\ref{sec:impl}, Appendix~\ref{app:harness}).
+\item We position the approach relative to the two adjacent literatures --- \textbf{complementary} to reactive observation management, \textbf{orthogonal} to input-side tool-advertisement reduction (Section~\ref{sec:related}).
+\end{enumerate}
+The components are individually old; the contribution is their synthesis for agent tool outputs, the security treatment, and the measurement.
+
+\section{Background}\label{sec:background}
+
+\paragraph{Tool I/O in MCP.} MCP~\citep{mcp} standardizes how a client discovers and invokes tools: the client lists a server's tools and their schemas, then calls a tool and receives a result composed of content parts (text, image, and binary or embedded-resource forms). Binary content is conventionally base64-encoded and carried inline in the result, which the client appends to the model's context.
+
+\paragraph{Why context size matters beyond cost.} Token-based pricing and the quadratic cost of attention make long contexts expensive, but the more insidious problem is that models \emph{degrade} as context grows. The ``lost in the middle'' effect~\citep{lostmiddle} and subsequent ``context rot'' analyses~\citep{contextrot} show that retrieval and reasoning quality fall as irrelevant tokens accumulate, even well within the nominal context window. A context half-consumed by base64 is not merely costlier; it is measurably worse at the task.
+
+\paragraph{Why binary is the tokenizer's worst case.} Byte-pair-encoding tokenizers earn their compression from recurring subword structure in natural language and code. Base64 of already-compressed binary (PNG, JPEG, PDF are all entropy-coded internally) is close to random over a 64-symbol alphabet: it has essentially no reusable structure, so it fragments into many short tokens. We measure this at roughly $0.91$ tokens per raw byte (Section~\ref{sec:eval}) --- far worse than the three-to-four-characters-per-token rule of thumb for prose.
+
+\section{The Pathology of Inline Binary Outputs}\label{sec:pathology}
+
+Consider the lifecycle of a rendered figure. A tool executes, produces a PNG, base64-encodes it, and embeds the encoded string in its result. The client appends the entire result --- including the encoded image --- to the model's context, where it remains for the rest of the session.
+
+Three properties make this pathological.
+
+\paragraph{Inflation and fragmentation.} The base64 step inflates the payload by ${\sim}33\%$ before tokenization, and the encoded string then tokenizes at ${\sim}0.91$ tokens per raw byte. A modest 30~KB figure becomes ${\sim}27{,}000$ tokens.
+
+\paragraph{Permanence.} Unlike a transient computation whose result is consumed and forgotten, the blob stays resident. Every subsequent model call re-processes it. It is carried across summarization boundaries --- a summary must either reproduce a reference to a multi-thousand-token artifact or drop it entirely --- and it persists in any transcript that is logged, replayed, or resumed. The cost is paid not once but on every turn until eviction.
+
+\paragraph{No reasoning value.} In the overwhelmingly common case, the model does not need the raw bytes of a figure it just rendered. Those bytes are destined for a human's eyes, delivered through a user interface; they are not inputs to the model's reasoning. Yet the inline convention forces them through the model's context regardless.
+
+The result is a failure mode that scales with the \emph{incidental size of the agent's own outputs} rather than with task difficulty. An artifact-heavy session --- a report build, a figure pass, an exploratory analysis --- accumulates blobs until the window saturates, forcing truncation, summarization, or a fresh session. The agent's effective capability is bounded by base64 it never needed to read.
+
+\section{The Pattern: Output by Reference}\label{sec:pattern}
+
+The remedy is to decouple \emph{delivery} of the bytes from the tool-result channel. When a tool produces an output, it writes the bytes to an out-of-band store and returns, in the tool result, only a \textbf{reference} to them: a URI at which the bytes can be retrieved, together with metadata describing them.
+
+Concretely, for each output the tool returns a compact record:
+
+\begin{lstlisting}[style=code,caption={The metadata record returned in place of inline bytes.},label={lst:record}]
+{
+  "name": "figure.png",
+  "bytes": 29901,
+  "sha256": "...",
+  "mime": "image/png",
+  "url": "https://host.example/sandbox-out/<token>/figure.png",
+  "expires_in": 3600
+}
+\end{lstlisting}
+
+The model sees this record; the bytes are elsewhere. Retrieval is \emph{on demand}: the URI is dereferenced only when the bytes are actually needed --- a human opens it to view the figure, or a later multimodal step deliberately feeds the image back to the model. In the common case, the bytes never re-enter the model's context at all.
+
+\paragraph{The reference is a URI; its scheme selects delivery.} Expressing the reference as a URI, rather than fixing it to one transport, keeps the pattern independent of how the tool and client are connected. Three instantiations cover the common deployments:
+\begin{itemize}
+\item \texttt{https://}~--- \textbf{a capability URL} (our measured instantiation): the bytes are served over HTTP(S) from an out-of-band store, retrievable by any HTTP client, across hosts. Section~\ref{sec:security} gives its security model.
+\item \texttt{file:///}~--- \textbf{a co-located reference}: when the tool and client share a filesystem --- for example a stdio server running as a subprocess of the client --- the client reads the bytes directly, with no HTTP endpoint at all.
+\item \textbf{an in-protocol resource-link URI}: MCP already exposes resources through a \texttt{resources/read} call, so the reference can be an MCP resource URI the client fetches over the \emph{existing} session --- no separate endpoint, and the session itself carries the authorization.
+\end{itemize}
+The metadata record is identical across all three; only the scheme --- and hence the retrieval path and trust model --- differs. The measurements in Section~\ref{sec:eval} are unaffected by the choice, because the record's size does not depend on the scheme.
+
+\paragraph{Property (Bounded Output Context Cost).} \emph{The LLM context cost of returning a tool output is $O(1)$ in the byte size of that output.} The metadata record is fixed-size whether the payload is 40~KB or 40~MB; only the on-demand fetch, if it ever happens, pays for the bytes. This is the output-side dual of the constant-cost properties that indirection provides on the input side (Section~\ref{sec:related}).
+
+\paragraph{The inline escape hatch.} Not every output should be referenced. A short CSV, a log tail, or a small JSON object that the model will reason over is cheap inline and \emph{inconvenient} \bref{} --- a network round-trip to read three lines. We therefore retain an inline path for outputs that are both below a size threshold and of textual type, and reference everything else. In our implementation the threshold is 4~KB of text. The pattern thus targets precisely the outputs that are simultaneously \emph{large} and \emph{opaque to reasoning}: binaries. Small text stays where it is useful; large binaries move out of the way. Figure~\ref{fig:routing-policy} summarizes the routing decision and the three delivery schemes.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{fig03_routing_policy}
+  \caption{Output routing policy. Small textual outputs are inlined; everything
+    else is returned by reference as a fixed-size metadata record. The URI
+    scheme (\texttt{https://}, \texttt{file:///}, or an MCP resource link)
+    selects the delivery path and its trust model, while the metadata record
+    stays identical across all three.}
+  \label{fig:routing-policy}
+\end{figure}
+
+\section{Security Model}\label{sec:security}
+
+This section concerns the \textbf{HTTPS capability-URL} instantiation, whose networked, unauthenticated retrieval path needs the most care; the co-located schemes of Section~\ref{sec:pattern} inherit their trust model instead from the environment (\texttt{file://} from filesystem permissions, a resource-link URI from the authenticated MCP session), and are noted where they differ.
+
+The reference is a \textbf{capability URL}: a URL containing a high-entropy, unguessable token whose \emph{possession is itself the authorization} to retrieve the resource. There is no separate credential exchange --- holding the URL is necessary and sufficient.
+
+\paragraph{Construction.} The token is drawn from a cryptographically secure random source with ${\sim}256$ bits of entropy (in our implementation, \texttt{secrets.token\_urlsafe(32)}) and namespaces a per-invocation directory: \texttt{/<token>/<filename>}. The filename remains human-meaningful; the secret lives in the path segment \emph{above} it. This separation matters. A predictable or leaked filename discloses nothing without the token, and issuing a fresh token per tool invocation confines the blast radius of any single leak to one call's outputs rather than the whole store.
+
+Four properties carry the security.
+\begin{enumerate}
+\item \textbf{Entropy.} 256 bits is unguessable and unenumerable at any feasible request rate. Predictable identifiers --- sequential IDs, timestamps, UUIDv1 (which encodes a clock and MAC) --- must not be used. A CSPRNG token is required; UUIDv4 (122 bits) is acceptable but weaker, and \texttt{token\_urlsafe(32)} is the cleaner primitive.
+\item \textbf{Non-enumerability.} Directory listing MUST be disabled at the server. If a token directory is listable, the unguessable token becomes \emph{enumerable from its parent}, and the entire model collapses. This is load-bearing configuration, not cosmetic.
+\item \textbf{Bounded lifetime.} Each capability is valid only for a time-to-live (TTL), after which a garbage collector deletes the staged bytes and the URL returns 404. The TTL bounds the exposure window of any leaked URL --- via a proxy log, browser history, a referrer header, a shoulder-surf. The garbage collector is therefore a \emph{security control}, not mere housekeeping: leaks self-heal on a fixed schedule.
+\item \textbf{Integrity.} The metadata carries the SHA-256 of the payload, so a client can verify that retrieved bytes match what the tool produced, independent of transport integrity. It also lets a consumer confirm a file's identity \emph{without pulling it into context} --- comparing hashes is cheap; ingesting the bytes is the thing we are avoiding.
+\end{enumerate}
+
+\paragraph{Transport hygiene.} Serve over TLS, since the token travels in the URL and must never cross plaintext; disable access logging for the capability location so tokens do not accumulate in server logs; and mark responses \texttt{noindex} so they cannot be indexed.
+
+\paragraph{Honest limitations.} The model is deliberately a \emph{bearer} model: anyone who obtains a live URL within its TTL can retrieve the bytes with no further authentication. That is the point --- it is what lets an ordinary HTTP client (an agent's fetch tool, or a browser) retrieve the artifact without a credential handshake. But it means the URL \emph{is} a secret and must be handled like one: appropriate inside a chat transcript and a browser; inappropriate in a public bug report or a shared screenshot. The base design also offers no per-fetch authorization and no revocation before the TTL elapses.
+
+\paragraph{Strengthening knobs, for sensitive outputs, in increasing strictness.}
+\begin{itemize}
+\item \emph{Single-use tokens.} Delete the staged bytes on the first successful retrieval. This eliminates the ``leaked URL lingers'' window entirely; the tradeoff is that the artifact cannot be re-fetched, which is usually acceptable for a figure a human views once.
+\item \emph{Retained authentication.} Keep the server's existing authentication (for example HTTP basic auth) on the capability location and have the fetcher present credentials. Strictly safer, but it defeats frictionless fetching, so it is warranted only when outputs are routinely sensitive.
+\end{itemize}
+
+\paragraph{A comparative claim.} By-reference exposure is \emph{lower} than the status quo it replaces. Base64-in-context is not exposure-free: those bytes persist in the model's context, which is logged, summarized, retained, and potentially replayed, indefinitely. Trading a permanent, opaque, retained exposure for a bounded, auditable, self-deleting one is a net security improvement, not a new risk.
+
+\paragraph{Content trust and the injection surface.} The context window is a trust boundary: any bytes placed in it can influence the model's behavior, and indirect prompt injection~\citep{greshake} exploits precisely this. Returning binary outputs by reference reduces what crosses that boundary --- a payload concealed in an artifact's bytes (in metadata fields, in appended data, or as a blob that triggers a downstream decoder) never enters the context, and the on-demand fetch turns a silent ingestion into an explicit, inspectable step at which content can be scanned before use. This is \emph{surface reduction, not prevention}, and three limits bound it. First, the inline escape hatch (Section~\ref{sec:pattern}) admits sub-threshold text unchanged --- and text, not binary, is the usual injection vector --- so the mechanism does nothing for a short malicious text output. Second, and more subtly, the metadata record is itself attacker-influenceable and \emph{is} inlined: the \texttt{name} field is a filename, so a tool whose output an adversary can shape may emit a file whose \emph{name} carries injected instructions, placing them in the very context the bytes no longer occupy. The surface is thus relocated to the metadata, not eliminated, and an implementation must treat \texttt{name} (and, secondarily, \texttt{mime}) as untrusted input to be sanitized before it reaches the model. Third, if a later step dereferences the URI, the deferred content re-enters the context and its trust must be evaluated at that point. Return-by-reference therefore \emph{narrows and makes explicit} the point at which untrusted bytes cross into the model's context; it does not, by itself, establish that what crosses is safe.
+
+\section{Reference Implementation}\label{sec:impl}
+
+We implemented the pattern in a self-hosted MCP server that executes code in disposable sandboxes and returns the resulting artifacts. The change to the server is a single output-collection routine plus a shape change to the tool result. Figure~\ref{fig:publishing-workflow} traces an artifact end to end through the seven stages detailed below.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{fig02_reference_workflow}
+  \caption{Output-publishing pipeline. A tool call's files are hashed,
+    tokenized, and staged (steps 1--3); the MCP client receives only a
+    fixed-size metadata record (step 4); \texttt{nginx} serves the bytes over a
+    capability URL (step 5) to on-demand consumers (step 6); and a
+    garbage-collection timer expires staged artifacts after their TTL (step 7).
+    Solid arrows denote eager transfers, dashed arrows on-demand access.}
+  \label{fig:publishing-workflow}
+\end{figure}
+
+\paragraph{Output collection.} After a sandboxed execution finishes, a host-side routine (\texttt{\_publish\_outputs}) enumerates the output directory. For each file it records the byte size, computes the SHA-256 and MIME type, generates a fresh capability token, moves the bytes into a web-served staging directory under that token, sets file permissions readable by the web server, and constructs the metadata record with the capability URL and TTL. Text files below the inline threshold are additionally inlined. The routine returns a list of metadata records in place of the former base64 map; every return path (including timeout and error paths) is updated to return the same list shape so consumers can rely on it.
+
+\paragraph{Serving.} A reverse proxy (nginx) exposes the staging directory through a dedicated location with directory listing disabled, access logging disabled, and authentication disabled (the token is the authentication). A configured public base URL lets the tool construct absolute capability URLs.
+
+\paragraph{Expiry.} A periodic timer (a systemd \texttt{.timer} firing every 15~minutes) runs a find-and-delete over the staging tree, removing token directories older than the TTL. The timer's cadence is decoupled from the TTL so the sweep is cheap and the exposure bound is precise.
+
+\paragraph{Deployment specifics} are collected in Appendix~\ref{app:deploy}: the staging directory must live where the web server can traverse it (not beneath a \texttt{0700} service home); on SELinux systems it must carry the \texttt{httpd\_sys\_content\_t} type, applied \emph{before} the directory is populated and preserved across a tmpfs remount via the mount \texttt{context=} option; and, where the tool server runs rootless under a dedicated system user, artifacts must be owned appropriately for that user's namespace. These are practical traps, not conceptual ones, but each will produce a silent failure (a 403 or an empty fetch) if missed. The implementation and the measurement harness of Appendix~\ref{app:harness} are released as open source.
+
+\section{Evaluation}\label{sec:eval}
+
+We measure the LLM-context cost of returning a tool output inline (base64) versus \bref{} (capability-URL metadata), on real files of the types a geospatial analysis session produces and across a controlled size sweep.
+
+\paragraph{Methodology.} We tokenize with \texttt{o200k\_base} and cross-check with \texttt{cl100k\_base} --- both representative BPE tokenizers. Exact token counts are model-dependent, but we report \emph{ratios}, which are stable across tokenizers. The inline cost is the token count of the base64-encoded payload; the by-reference cost is the token count of the JSON metadata object \texttt{\{name, bytes, sha256, mime, url, expires\_in\}}. Real files are produced with Matplotlib and NumPy (a PNG plot, a vector PDF, a JPEG raster, a serialized NumPy array, and CSV tables); the synthetic sweep uses random bytes --- a faithful worst-case proxy for compressed binary --- to isolate the size-scaling relationship across three orders of magnitude. The harness is released as \texttt{bench/token\_cost.py} and measures real files via \texttt{-{}-dir}.
+
+\paragraph{Real files.} Table~\ref{tab:realfiles} reports costs for representative outputs of a burn-severity workflow.
+
+\begin{table}[htbp]\centering
+\caption{Inline vs.\ by-reference context cost for real files. Every binary format --- PNG, PDF, JPEG, NumPy --- tokenizes at ${\sim}915$--$930$ tokens/KB when base64-encoded; reference metadata is ${\sim}90$--$100$ tokens regardless of payload size or type.}\label{tab:realfiles}
+\begin{tabular}{lrlrrrr}
+\toprule
+File & Bytes & MIME & Inline & Ref. & Reduction & tok/KB \\
+\midrule
+figure.pdf   & 8{,}117   & application/pdf          & 7{,}270   & 93 & $78\times$    & 917 \\
+figure.png   & 31{,}047  & image/png                & 27{,}702  & 92 & $301\times$   & 914 \\
+map.jpg      & 90{,}795  & image/jpeg               & 81{,}825  & 94 & $870\times$   & 923 \\
+dnbr.npy     & 262{,}272 & application/octet-stream & 237{,}795 & 95 & $2{,}503\times$ & 928 \\
+points.csv   & 10{,}814  & text/csv                 & 8{,}785   & 99 & $89\times$    & 832 \\
+summary.csv  & 252       & text/csv                 & 240       & 95 & $3\times$     & 975 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Size sweep.} To isolate the scaling relationship, Table~\ref{tab:sweep} sweeps random-byte payloads from 1~KB to 1~MB.
+
+\begin{table}[htbp]\centering
+\caption{Size sweep. Inline cost is linear in payload size; reference cost is constant.}\label{tab:sweep}
+\begin{tabular}{lrrrr}
+\toprule
+Payload & Bytes & Inline & Ref. & Reduction \\
+\midrule
+1~KB   & 1{,}024     & 946     & 105 & $9\times$    \\
+16~KB  & 16{,}384    & 14{,}955  & 104 & $144\times$  \\
+64~KB  & 65{,}536    & 59{,}549  & 106 & $562\times$  \\
+256~KB & 262{,}144   & 238{,}720 & 101 & $2{,}364\times$ \\
+1~MB   & 1{,}048{,}576 & 954{,}812 & 107 & $8{,}923\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Four findings follow.
+
+\paragraph{Inline cost is linear, steep, and format-independent.} Base64-encoded binary costs ${\sim}920$ tokens per KB ($\approx 0.9$ tokens per raw byte), and this rate is nearly identical across PNG (914), PDF (917), JPEG (923), and NumPy (928) payloads --- unsurprising, since all are internally entropy-coded and therefore near-random once base64-encoded, leaving the tokenizer no reusable subword structure.
+
+\paragraph{Reference cost is constant.} Metadata consumes ${\sim}90$--$100$ tokens regardless of payload size or type --- 93 tokens for an 8~KB PDF, 95 for a 262~KB array. This is the empirical statement of the Bounded Output Context Cost property (Section~\ref{sec:pattern}). Because the numerator is constant and the denominator scales, the reduction obeys a simple law --- $\text{reduction} \approx 9.3 \times (\text{payload size in KB})$ --- ranging from $78\times$ for a small PDF to $2{,}503\times$ for a raster array.
+
+\paragraph{The text escape hatch is justified, not arbitrary.} Textual outputs behave differently and should stay inline. A CSV inlined as raw text costs ${\sim}0.6$ tokens/byte --- cheaper than base64 binary --- \emph{and}, unlike a base64 blob, its content remains legible to the model, which is frequently the reason for returning it. Base64-encoding the same text would be $1.4$--$1.6\times$ more expensive and destroy that legibility. Our policy therefore inlines small text (the 252-byte \texttt{summary.csv}) and references binary (the \texttt{.npy} raster). The boundary case of \emph{medium} text (the 10.8~KB \texttt{points.csv}, above the 4~KB inline cap) is referenced under the current policy; whether medium text should be referenced or inlined is an open question (Section~\ref{sec:open}).
+
+\paragraph{The reduction is tokenizer-stable for binary.} Cross-checking \texttt{o200k\_base} against \texttt{cl100k\_base}, the inline cost of binary payloads varies by only $+4.6\%$ to $+6.4\%$, so the reduction ratios in Tables~\ref{tab:realfiles}--\ref{tab:sweep} are robust to tokenizer choice. Text varies more (up to ${\sim}20\%$), as expected, since natural-language tokenization is more tokenizer-dependent than high-entropy base64 --- which, for this work, only strengthens the robustness of the binary result.
+
+\paragraph{Session-level impact.} The per-output costs compound. A single 31~KB figure costs 27{,}702 tokens inline versus 92 \bref{} ($301\times$). A routine twelve-figure session costs approximately 332{,}000 tokens inline versus ${\sim}1{,}100$ \bref{} --- the inline total \emph{alone exceeds a 200K-token context window}, forcing truncation or a session restart, while the by-reference total is negligible. This is not hypothetical: it is the failure mode that motivated this work.
+
+\section{Related Work and Positioning}\label{sec:related}
+
+This work sits at the intersection of two active lines of research, and its contribution is best understood by its relation to each.
+
+\paragraph{Complementary to observation management.} The closest literature manages context by acting on observations \emph{after} they enter it. Observation masking replaces older observations with placeholders~\citep{sweagent}; trajectory summarization condenses history into a running summary~\citep{openhands,supo}. A recent systematic study finds masking as effective as summarization at lower cost, and both reduce cost by more than half without hurting task performance~\citep{complexitytrap}. These approaches are \emph{reactive} --- they pay the ingestion cost, then compress or discard --- and \emph{lossy}: masking discards the content irrecoverably, and summarization is lossy compression that additionally costs a model call. Output-by-reference is \emph{preventive} and \emph{lossless}: the binary output never enters context, yet remains retrievable on demand. The two are complementary --- one still masks or summarizes the \emph{textual} observations that must be reasoned over; one references the \emph{binary} ones that need not be.
+
+\begin{table}[htbp]\centering
+\caption{Output-context strategies compared.}\label{tab:strategies}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lccc}
+\toprule
+Strategy & Enters context? & Recoverable? & Extra LLM cost? \\
+\midrule
+Observation masking & yes, then placeholdered & no (discarded) & no \\
+LLM summarization   & yes, then condensed     & lossy only     & yes (summarizer call) \\
+\textbf{Capability URL (this work)} & \textbf{never} & \textbf{yes (fetch on demand)} & \textbf{no} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\paragraph{Orthogonal to input-side reduction.} A parallel line reduces the context cost of \emph{tool advertisement} --- the schemas a model must see to know what tools exist. DADL's Code Mode replaces per-tool schema registration with a two-operation interface, reducing advertisement cost by a reported $142\times$ and holding it constant in catalog size~\citep{dadl}; MemTool manages tool memory dynamically across turns~\citep{memtool}. These bound the \emph{input} side of a tool call; the present work bounds the \emph{output} side. The philosophy is identical --- indirection to make context cost independent of payload size --- applied to opposite ends of the call. Output-by-reference is, in this sense, the output-side companion to Code Mode.
+
+\paragraph{Lineage.} The mechanism is not itself novel. Returning a lightweight reference in place of a large payload, to be redeemed from an external store, is the \textbf{Claim Check} pattern from enterprise integration~\citep{claimcheck}. Embedding an unguessable token in a URL such that possession grants access is a \textbf{capability URL}~\citep{capurls}, and is the basis of presigned object-store URLs and content-addressable storage. The contribution here is the synthesis of these for agent tool outputs, the MCP-specific security treatment (Section~\ref{sec:security}), the measurement (Section~\ref{sec:eval}), and an open reference implementation.
+
+\section{Discussion and Limitations}\label{sec:discussion}
+
+\paragraph{The statelessness dent.} The approach stages bytes on the host for up to the TTL, which slightly compromises a ``fully stateless'' tool. The compromise is bounded and self-cleaning: RAM-backing the staging directory (tmpfs) makes it evaporate on reboot, and the garbage collector caps steady-state footprint. Persistence is capped in both time (TTL) and space (GC), by construction.
+
+\paragraph{Applicability boundary.} The pattern helps only for outputs the model does not need to reason over token-by-token. Textual outputs that drive the agent's next action must still enter context --- inlined if small, masked or summarized if large (Section~\ref{sec:related}). By-reference targets the binary, opaque tail of the output distribution, which is precisely where the cost concentrates; it is not a universal context-management strategy.
+
+\paragraph{Bearer exposure.} As detailed in Section~\ref{sec:security}, the capability URL is a bearer credential. Deployments that handle sensitive outputs should adopt single-use tokens or retained authentication rather than the default open-GET configuration.
+
+\paragraph{Infrastructure precondition.} The pattern requires \emph{a} retrieval path --- but which one depends on the URI scheme (Section~\ref{sec:pattern}), and the heaviest option is not the only one. The HTTPS capability-URL instantiation needs an out-of-band serving path: a store, an HTTP endpoint, and a garbage collector; that cost is a property of \emph{that} instantiation, not of the pattern. A co-located deployment needs far less. A stdio MCP server, for instance, runs as a subprocess of the client and shares its filesystem, so it can stage the bytes and return a \texttt{file://} URI the client reads directly --- no HTTP endpoint, no network surface required. An in-protocol resource-link URI needs neither a store nor an endpoint, since the bytes travel over the existing session on demand. The real precondition is only that \emph{the URI scheme names a retrieval path the client can follow} --- which every deployment already has. What the pattern genuinely assumes is a client that dereferences references on demand rather than expecting inline bytes; given that, the serving mechanism scales down to match the deployment.
+
+\section{Open Questions}\label{sec:open}
+
+\paragraph{The inline-versus-reference decision.} We use a size-and-type threshold. Is there a better policy --- one that accounts for whether the model is likely to need the bytes downstream, perhaps informed by a client-side hint about the task?
+
+\paragraph{Standardization.} Should MCP define a first-class by-reference output type, or profile its existing resource-link mechanism, with capability-URL security, TTL, and integrity-hash semantics specified? A shared convention would let clients handle referenced outputs uniformly and let servers advertise the guarantee, rather than each deployment reinventing it.
+
+\paragraph{Multimodal round-trips.} When a later step genuinely needs the bytes --- a vision model reasoning over a chart --- it fetches them on demand, paying the ingestion cost then. How does the amortized cost of fetch-on-demand compare to always-inline across realistic workloads? We expect a large win whenever the fraction of outputs actually re-consumed is small, but this deserves direct measurement.
+
+\paragraph{Caching and content-addressing.} The SHA-256 already identifies content. A content-addressed store would deduplicate identical outputs within a session and enable client-side caching keyed by hash, at the cost of losing per-invocation token isolation --- a tradeoff worth characterizing.
+
+\section{Conclusion}\label{sec:conclusion}
+
+The state of the art manages large tool outputs \emph{reactively} --- compressing or discarding them after they have entered the model's context. We have argued that a class of outputs, binary artifacts, should never enter context at all, and shown that the decades-old Claim Check pattern, realized as a URI --- a capability URL in our measured implementation --- achieves exactly this: a fixed-size metadata record replaces the payload, the bytes are retrieved on demand, and the per-output context cost becomes $O(1)$ in payload size. Measured on a representative tokenizer, this is a $301\times$ reduction for a typical figure, and it turns an artifact-heavy session from a window-overflowing liability into a non-issue --- \emph{losslessly}, since the bytes remain retrievable, and at \emph{lower} security exposure than the base64 status quo, since a bounded, self-deleting capability replaces a permanent, retained blob. The mechanism is old; its application to agent tool outputs, its security treatment, and its measurement are, to our knowledge, new. We release a reference implementation and a measurement harness, and suggest that a by-reference output convention is worth standardizing in the Model Context Protocol.
+
+\paragraph{Code and data availability.} The reference implementation and the measurement harness of Appendix~\ref{app:harness} are released openly (GitHub/Zenodo).
+
+\paragraph{CRediT author statement.} \textbf{Peter Lemenkov:} Conceptualization, Methodology, Software, Validation, Formal analysis, Investigation, Data curation, Writing --- Original Draft, Writing --- Review \& Editing, Visualization.
+
+\paragraph{Acknowledgements.} The author thanks Polina Lemenkova for proposing and preparing the figures.
+
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem{dadl}
+A.~Dunkel.
+\newblock DADL: A Declarative Description Language for Enterprise Tool Libraries in LLM Agent Systems.
+\newblock Zenodo / arXiv:2605.05247, 2026.
+
+\bibitem{greshake}
+K.~Greshake, S.~Abdelnabi, S.~Mishra, C.~Endres, T.~Holz, and M.~Fritz.
+\newblock Not what you've signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection.
+\newblock ACM Workshop on Artificial Intelligence and Security (AISec), 2023. arXiv:2302.12173.
+
+\bibitem{claimcheck}
+G.~Hohpe and B.~Woolf.
+\newblock \emph{Enterprise Integration Patterns: Designing, Building, and Deploying Messaging Solutions}.
+\newblock Addison-Wesley, 2003. (Claim Check pattern.)
+
+\bibitem{contextrot}
+K.~Hong, A.~Troynikov, and J.~Huber.
+\newblock Context Rot: How Increasing Input Tokens Impacts LLM Performance.
+\newblock Chroma technical report, July 2025. \url{https://research.trychroma.com/context-rot}.
+
+\bibitem{complexitytrap}
+T.~Lindenbauer, I.~Slinko, L.~Felder, E.~Bogomolov, and Y.~Zharov.
+\newblock The Complexity Trap: Simple Observation Masking Is as Efficient as LLM Summarization for Agent Context Management.
+\newblock arXiv:2508.21433, 2025.
+
+\bibitem{lostmiddle}
+N.~F. Liu, K.~Lin, J.~Hewitt, A.~Paranjape, M.~Bevilacqua, F.~Petroni, and P.~Liang.
+\newblock Lost in the Middle: How Language Models Use Long Contexts.
+\newblock \emph{Transactions of the Association for Computational Linguistics}, 12:157--173, 2024. \url{https://doi.org/10.1162/tacl_a_00638}.
+
+\bibitem{supo}
+M.~Lu, W.~Sun, W.~Du, Z.~Ling, X.~Yao, K.~Liu, and J.~Chen.
+\newblock Scaling LLM Multi-turn RL with End-to-end Summarization-based Context Management.
+\newblock arXiv:2510.06727, 2025.
+
+\bibitem{memtool}
+E.~Lumer, A.~Gulati, V.~K. Subbiah, P.~Basavaraju, and J.~A. Burke.
+\newblock MemTool: Optimizing Short-Term Memory Management for Dynamic Tool Calling in LLM Agent Multi-Turn Conversations.
+\newblock arXiv:2507.21428, 2025.
+
+\bibitem{openhands}
+X.~Wang et al.
+\newblock OpenHands: An Open Platform for AI Software Developers as Generalist Agents.
+\newblock ICLR, 2025. (LLM-summary context management.)
+
+\bibitem{sweagent}
+J.~Yang, C.~E. Jimenez, A.~Wettig, K.~Lieret, S.~Yao, K.~Narasimhan, and O.~Press.
+\newblock SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering.
+\newblock NeurIPS, 2024. (Observation masking.)
+
+\bibitem{capurls}
+J.~Tennison (ed.).
+\newblock Good Practices for Capability URLs.
+\newblock W3C Technical Architecture Group, First Public Working Draft, 18~February 2014. \url{https://www.w3.org/TR/capability-urls/}.
+
+\bibitem{mcp}
+Anthropic.
+\newblock Model Context Protocol specification.
+\newblock \url{https://modelcontextprotocol.io}, 2024.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Measurement harness (\texttt{bench/token\_cost.py})}\label{app:harness}
+
+\begin{lstlisting}[style=py,caption={Measurement harness: inline base64 vs by-reference metadata token cost.},label={lst:harness}]
+#!/usr/bin/env python3
+"""
+token_cost.py -- LLM-context cost of tool outputs: inline base64 vs by-reference
+(capability-URL metadata). Demonstrates Bounded Output Context Cost: inline
+scales with payload size; metadata is ~constant.
+
+Random bytes stand in for compressed binary (PNG/JPEG/PDF) -- the worst case for
+a BPE tokenizer. Use --dir to measure real files.
+
+    pip install tiktoken
+    python token_cost.py                 # synthetic size sweep
+    python token_cost.py --dir outputs/  # real files
+"""
+import argparse, base64, hashlib, json, mimetypes, os, sys
+import tiktoken
+
+ENCODINGS = ("o200k_base", "cl100k_base")   # report both; ratio is stable across BPEs
+
+def meta_json(name, data, mime):
+    return json.dumps({
+        "name": name, "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(), "mime": mime,
+        "url": f"https://host.example/sandbox-out/{'A'*43}/{name}",
+        "expires_in": 3600,
+    })
+
+def measure(enc, name, data, mime):
+    inline = len(enc.encode(base64.b64encode(data).decode()))
+    meta   = len(enc.encode(meta_json(name, data, mime)))
+    return len(data), inline, meta
+
+def report(enc, items):
+    print(f"\n[{enc.name}]")
+    print(f"{'payload':<22}{'bytes':>10}{'inline':>10}{'meta':>7}{'ratio':>8}{'tok/KB':>8}")
+    print("-" * 65)
+    for label, data, mime, name in items:
+        raw, inline, meta = measure(enc, name, data, mime)
+        print(f"{label:<22}{raw:>10}{inline:>10}{meta:>7}{inline/meta:>8.0f}{inline/(raw/1024):>8.1f}")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", help="measure real files here instead of a synthetic sweep")
+    a = ap.parse_args()
+
+    items = []
+    if a.dir:
+        for fn in sorted(os.listdir(a.dir)):
+            p = os.path.join(a.dir, fn)
+            if os.path.isfile(p):
+                data = open(p, "rb").read()
+                mime = mimetypes.guess_type(fn)[0] or "application/octet-stream"
+                items.append((fn[:22], data, mime, fn))
+    else:
+        for kb in (1, 4, 16, 64, 256, 1024):
+            items.append((f"random {kb}KB", os.urandom(kb * 1024),
+                          "application/octet-stream", f"blob_{kb}k.bin"))
+
+    for name in ENCODINGS:
+        try:
+            report(tiktoken.get_encoding(name), items)
+        except Exception as e:
+            print(f"[{name}] unavailable: {e}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
+\end{lstlisting}
+
+\section{Deployment specifics (self-hosted, Fedora/SELinux/nginx)}\label{app:deploy}
+
+These are the practical requirements for the reference implementation; each, if missed, produces a silent failure rather than an error.
+
+\paragraph{Staging directory.} Place it where the web server can traverse it --- e.g.\ \texttt{/var/cache/mcp-sandbox/outputs}, owned by the tool-server's service user, with every directory in the chain mode \texttt{0755}. Do \textbf{not} place it under the service user's home if that home is \texttt{0700}; the web server cannot traverse into it.
+
+\paragraph{SELinux.} The staged files must carry the web-content type so the confined web server may read them:
+\begin{lstlisting}[style=code]
+semanage fcontext -a -t httpd_sys_content_t "/var/cache/mcp-sandbox/outputs(/.*)?"
+restorecon -RFv /var/cache/mcp-sandbox/outputs
+\end{lstlisting}
+Apply the \texttt{fcontext} rule \emph{before} populating the directory, so files are born with the correct label. If the directory is tmpfs-backed, a fresh mount comes up unlabeled; carry the label as a mount option instead so it survives remounts:
+\begin{lstlisting}[style=code]
+tmpfs /var/cache/mcp-sandbox/outputs tmpfs \
+  rw,nosuid,nodev,size=512m,mode=0755,uid=sandbox,gid=sandbox,\
+  context="system_u:object_r:httpd_sys_content_t:s0" 0 0
+\end{lstlisting}
+
+\paragraph{nginx location.} Serve the staging directory with listing, logging, and auth off:
+\begin{lstlisting}[style=code]
+location /sandbox-out/ {
+    alias /var/cache/mcp-sandbox/outputs/;
+    auth_basic off;                 # the capability token is the authorization
+    autoindex off;                  # non-enumerable: no directory listing
+    access_log off;                 # keep tokens out of logs
+    add_header X-Robots-Tag "noindex" always;
+}
+\end{lstlisting}
+
+\paragraph{Garbage-collection timer.} A \texttt{oneshot} service plus a timer firing every 15 minutes:
+\begin{lstlisting}[style=code]
+# mcp-sandbox-gc.service
+[Service]
+Type=oneshot
+User=sandbox
+ExecStart=/usr/bin/find /var/cache/mcp-sandbox/outputs -mindepth 1 -depth -mmin +60 -delete
+
+# mcp-sandbox-gc.timer
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+[Install]
+WantedBy=timers.target
+\end{lstlisting}
+Keep the \texttt{-mmin} bound equal to the TTL (here 60 minutes); if the TTL is made configurable, drive both from a shared environment file so they cannot drift.
+
+\paragraph{Rootless service user.} Where the tool server runs rootless under a dedicated system user (e.g.\ \texttt{sandbox}, uid 955), note that container-produced files may be owned by the user's namespaced identity; the publish routine runs as the service user on the host and moves the bytes into the staging directory, so ownership is consistent as long as the staging directory itself is owned by that user.
+
+\end{document}

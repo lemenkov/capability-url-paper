@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: CC0-1.0
+
+*~
+article_capability_urls.aux
+article_capability_urls.log
+article_capability_urls.out
+article_capability_urls.pdf
+fig01_inline_vs_reference.pdf
+fig01_inline_vs_reference.png
+fig02_reference_workflow.pdf
+fig02_reference_workflow.png
+fig03_routing_policy.pdf
+fig03_routing_policy.png
