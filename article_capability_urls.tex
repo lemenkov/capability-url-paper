@@ -8,7 +8,7 @@
 
 %% article_capability_urls.tex
 %% Engineering note for arXiv/Zenodo. Compile: pdflatex x2 (inline thebibliography, no bibtex).
-%% Source kept ASCII (see the skill's ASCII discipline); no non-ASCII inside lstlisting.
+%% Source kept ASCII; no non-ASCII inside lstlisting.
 \documentclass[11pt]{article}
 
 \usepackage[T1]{fontenc}
@@ -63,7 +63,7 @@ represent an endorsement or official position of Red Hat.  Correspondence:
 \maketitle
 
 \begin{abstract}
-LLM agents increasingly invoke tools that produce large or binary outputs --- figures, PDFs, data files. Tool results commonly return these inline as base64 --- the default afforded by the content model of protocols like the Model Context Protocol (MCP) --- which permanently inflates the agent's context. We measure this cost: base64-encoded binary consumes ${\sim}930$ tokens per KB under a representative BPE tokenizer, so a single 30~KB figure costs ${\sim}27{,}000$ tokens, and a twelve-figure session costs ${\sim}332{,}000$ tokens --- enough to overflow a 200K context window on its own. We describe a preventive alternative: return the output \emph{\bref{}} --- a URI plus fixed-size metadata (size, MIME type, integrity hash) --- and fetch the bytes on demand only when needed. The URI's scheme selects the delivery mechanism; our measured instantiation is a short-lived HTTPS capability URL. This realizes the decades-old \emph{Claim Check} integration pattern --- the claim check is a URI --- and yields \textbf{Bounded Output Context Cost}: the context cost of a tool output is $O(1)$ in its payload size (${\sim}90$--$100$ tokens, measured, independent of file size), a $301\times$ reduction for a typical figure. We give a hardened reference implementation with an MCP-specific security analysis, and position the approach as complementary to observation-masking and summarization (which act reactively and lossily \emph{after} outputs enter context) and orthogonal to input-side tool-advertisement reduction. Reference implementation open-sourced.
+LLM agents increasingly invoke tools that produce large or binary outputs --- figures, PDFs, data files. Tool results commonly return these inline as base64 --- the default afforded by the content model of protocols like the Model Context Protocol (MCP) --- which permanently inflates the agent's context. We measure this cost: base64-encoded binary consumes ${\sim}920$ tokens per KB under a representative BPE tokenizer, so a single 30~KB figure costs ${\sim}27{,}000$ tokens, and a twelve-figure session costs ${\sim}332{,}000$ tokens --- enough to overflow a 200K context window on its own. We describe a preventive alternative: return the output \emph{\bref{}} --- a URI plus fixed-size metadata (size, MIME type, integrity hash) --- and fetch the bytes on demand only when needed. The URI's scheme selects the delivery mechanism; our measured instantiation is a short-lived HTTPS capability URL. This realizes the decades-old \emph{Claim Check} integration pattern --- the claim check is a URI --- and yields \textbf{Bounded Output Context Cost}: the context cost of a tool output is $O(1)$ in its payload size (${\sim}90$--$100$ tokens, measured, independent of file size), a $301\times$ reduction for a typical figure. We give a hardened reference implementation with an MCP-specific security analysis, and position the approach as complementary to observation-masking and summarization (which act reactively and lossily \emph{after} outputs enter context) and orthogonal to input-side tool-advertisement reduction. Reference implementation open-sourced.
 \end{abstract}
 
 \section{Introduction}\label{sec:intro}
@@ -93,7 +93,7 @@ We argue for a different move for a specific class of outputs. A rendered figure
 
 \paragraph{Contributions.}
 \begin{enumerate}
-\item We characterize and \textbf{measure} the context cost of inline binary tool outputs, showing it is linear in payload size at ${\sim}930$ tokens/KB and compounds to window-overflowing totals over realistic sessions (Section~\ref{sec:eval}).
+\item We characterize and \textbf{measure} the context cost of inline binary tool outputs, showing it is linear in payload size at ${\sim}920$ tokens/KB and compounds to window-overflowing totals over realistic sessions (Section~\ref{sec:eval}).
 \item We describe the \textbf{output-by-reference} pattern for agent tools and name its defining property, \textbf{Bounded Output Context Cost}: the context cost of a tool output is $O(1)$ in the size of its payload (Section~\ref{sec:pattern}).
 \item We give an MCP-specific \textbf{security model} for the capability-URL mechanism, including its honest bearer-token limitations and stricter variants (Section~\ref{sec:security}).
 \item We provide an open-source \textbf{reference implementation} and measurement harness (Section~\ref{sec:impl}, Appendix~\ref{app:harness}).
@@ -107,7 +107,7 @@ The components are individually old; the contribution is their synthesis for age
 
 \paragraph{Why context size matters beyond cost.} Token-based pricing and the quadratic cost of attention make long contexts expensive, but the more insidious problem is that models \emph{degrade} as context grows. The ``lost in the middle'' effect~\citep{lostmiddle} and subsequent ``context rot'' analyses~\citep{contextrot} show that retrieval and reasoning quality fall as irrelevant tokens accumulate, even well within the nominal context window. A context half-consumed by base64 is not merely costlier; it is measurably worse at the task.
 
-\paragraph{Why binary is the tokenizer's worst case.} Byte-pair-encoding tokenizers earn their compression from recurring subword structure in natural language and code. Base64 of already-compressed binary (PNG, JPEG, PDF are all entropy-coded internally) is close to random over a 64-symbol alphabet: it has essentially no reusable structure, so it fragments into many short tokens. We measure this at roughly $0.91$ tokens per raw byte (Section~\ref{sec:eval}) --- far worse than the three-to-four-characters-per-token rule of thumb for prose.
+\paragraph{Why binary is the tokenizer's worst case.} Byte-pair-encoding tokenizers earn their compression from recurring subword structure in natural language and code. Base64 of already-compressed binary (PNG, JPEG, PDF are all entropy-coded internally) is close to random over a 64-symbol alphabet: it has essentially no reusable structure, so it fragments into many short tokens. We measure this at roughly $0.9$ tokens per raw byte (Section~\ref{sec:eval}) --- far worse than the three-to-four-characters-per-token rule of thumb for prose.
 
 \section{The Pathology of Inline Binary Outputs}\label{sec:pathology}
 
@@ -115,7 +115,7 @@ Consider the lifecycle of a rendered figure. A tool executes, produces a PNG, ba
 
 Three properties make this pathological.
 
-\paragraph{Inflation and fragmentation.} The base64 step inflates the payload by ${\sim}33\%$ before tokenization, and the encoded string then tokenizes at ${\sim}0.91$ tokens per raw byte. A modest 30~KB figure becomes ${\sim}27{,}000$ tokens.
+\paragraph{Inflation and fragmentation.} The base64 step inflates the payload by ${\sim}33\%$ before tokenization, and the encoded string then tokenizes at ${\sim}0.9$ tokens per raw byte. A modest 30~KB figure becomes ${\sim}27{,}000$ tokens.
 
 \paragraph{Permanence.} Unlike a transient computation whose result is consumed and forgotten, the blob stays resident. Every subsequent model call re-processes it. It is carried across summarization boundaries --- a summary must either reproduce a reference to a multi-thousand-token artifact or drop it entirely --- and it persists in any transcript that is logged, replayed, or resumed. The cost is paid not once but on every turn until eviction.
 
@@ -217,15 +217,15 @@ We implemented the pattern in a self-hosted MCP server that executes code in dis
 
 \paragraph{Serving.} A reverse proxy (nginx) exposes the staging directory through a dedicated location with directory listing disabled, access logging disabled, and authentication disabled (the token is the authentication). A configured public base URL lets the tool construct absolute capability URLs.
 
-\paragraph{Expiry.} A periodic timer (a systemd \texttt{.timer} firing every 15~minutes) runs a find-and-delete over the staging tree, removing token directories older than the TTL. The timer's cadence is decoupled from the TTL so the sweep is cheap and the exposure bound is precise.
+\paragraph{Expiry.} A periodic timer (a systemd \texttt{.timer} firing every 15~minutes) runs a find-and-delete over the staging tree, removing token directories older than the TTL. The timer's cadence is decoupled from the TTL so the sweep stays cheap; the exposure bound is the TTL plus at most one sweep interval (here 75~minutes worst case).
 
-\paragraph{Deployment specifics} are collected in Appendix~\ref{app:deploy}: the staging directory must live where the web server can traverse it (not beneath a \texttt{0700} service home); on SELinux systems it must carry the \texttt{httpd\_sys\_content\_t} type, applied \emph{before} the directory is populated and preserved across a tmpfs remount via the mount \texttt{context=} option; and, where the tool server runs rootless under a dedicated system user, artifacts must be owned appropriately for that user's namespace. These are practical traps, not conceptual ones, but each will produce a silent failure (a 403 or an empty fetch) if missed. The implementation and the measurement harness of Appendix~\ref{app:harness} are released as open source.
+\paragraph{Deployment specifics} are collected in Appendix~\ref{app:deploy}: the staging directory must live where the web server can traverse it (not beneath a \texttt{0700} service home); on SELinux systems it must carry the \texttt{httpd\_sys\_content\_t} type, applied \emph{before} the directory is populated and preserved across a tmpfs remount via the mount \texttt{context=} option; and, where the tool server runs rootless under a dedicated system user, artifacts must be owned appropriately for that user's namespace. These are practical traps, not conceptual ones, but each will produce a silent failure (a 403 or an empty fetch) if missed. The implementation and the measurement harness of Appendix~\ref{app:harness} are released as open source (see Code and data availability).
 
 \section{Evaluation}\label{sec:eval}
 
 We measure the LLM-context cost of returning a tool output inline (base64) versus \bref{} (capability-URL metadata), on real files of the types a geospatial analysis session produces and across a controlled size sweep.
 
-\paragraph{Methodology.} We tokenize with \texttt{o200k\_base} and cross-check with \texttt{cl100k\_base} --- both representative BPE tokenizers. Exact token counts are model-dependent, but we report \emph{ratios}, which are stable across tokenizers. The inline cost is the token count of the base64-encoded payload; the by-reference cost is the token count of the JSON metadata object \texttt{\{name, bytes, sha256, mime, url, expires\_in\}}. Real files are produced with Matplotlib and NumPy (a PNG plot, a vector PDF, a JPEG raster, a serialized NumPy array, and CSV tables); the synthetic sweep uses random bytes --- a faithful worst-case proxy for compressed binary --- to isolate the size-scaling relationship across three orders of magnitude. The harness is released as \texttt{bench/token\_cost.py} and measures real files via \texttt{-{}-dir}.
+\paragraph{Methodology.} We tokenize with \texttt{o200k\_base} and cross-check with \texttt{cl100k\_base} --- both representative BPE tokenizers. Exact token counts are model-dependent, but we report \emph{ratios}, which are stable across tokenizers. The inline cost is the token count of the base64-encoded payload; the by-reference cost is the token count of the JSON metadata object \texttt{\{name, bytes, sha256, mime, url, expires\_in\}}. Real files are produced with Matplotlib and NumPy (a PNG plot, a vector PDF, a JPEG raster, a serialized NumPy array, and CSV tables); the synthetic sweep uses random bytes --- a faithful worst-case proxy for compressed binary --- to isolate the size-scaling relationship across three orders of magnitude. The harness is released with the paper source as \texttt{bench/token\_cost.py} and measures real files via \texttt{-{}-dir}.
 
 \paragraph{Real files.} Table~\ref{tab:realfiles} reports costs for representative outputs of a burn-severity workflow.
 
@@ -329,9 +329,9 @@ LLM summarization   & yes, then condensed     & lossy only     & yes (summarizer
 
 The state of the art manages large tool outputs \emph{reactively} --- compressing or discarding them after they have entered the model's context. We have argued that a class of outputs, binary artifacts, should never enter context at all, and shown that the decades-old Claim Check pattern, realized as a URI --- a capability URL in our measured implementation --- achieves exactly this: a fixed-size metadata record replaces the payload, the bytes are retrieved on demand, and the per-output context cost becomes $O(1)$ in payload size. Measured on a representative tokenizer, this is a $301\times$ reduction for a typical figure, and it turns an artifact-heavy session from a window-overflowing liability into a non-issue --- \emph{losslessly}, since the bytes remain retrievable, and at \emph{lower} security exposure than the base64 status quo, since a bounded, self-deleting capability replaces a permanent, retained blob. The mechanism is old; its application to agent tool outputs, its security treatment, and its measurement are, to our knowledge, new. We release a reference implementation and a measurement harness, and suggest that a by-reference output convention is worth standardizing in the Model Context Protocol.
 
-\paragraph{Code and data availability.} The reference implementation and the measurement harness of Appendix~\ref{app:harness} are released openly (GitHub/Zenodo).
+\paragraph{Code and data availability.} The reference implementation (\texttt{mcp-sandbox}) is released under the Apache-2.0 license at \url{https://github.com/lemenkov/mcp-sandbox}. The measurement harness of Appendix~\ref{app:harness} (\texttt{bench/token\_cost.py}, Apache-2.0) is released together with the paper source at \url{https://github.com/lemenkov/capability-url-paper}.
 
-\paragraph{CRediT author statement.} \textbf{Peter Lemenkov:} Conceptualization, Methodology, Software, Validation, Formal analysis, Investigation, Data curation, Writing --- Original Draft, Writing --- Review \& Editing, Visualization.
+\paragraph{CRediT author statement.} \textbf{Peter Lemenkov:} Conceptualization, Methodology, Software, Validation, Formal analysis, Investigation, Data curation, Writing --- Original Draft, Writing --- Review \& Editing.
 
 \paragraph{Acknowledgements.} The author thanks Polina Lemenkova for proposing and preparing the figures.
 
