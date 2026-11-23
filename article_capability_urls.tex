@@ -95,6 +95,7 @@ We argue for a different move for a specific class of outputs. A rendered figure
 \begin{enumerate}
 \item We characterize and \textbf{measure} the context cost of inline binary tool outputs, showing it is linear in payload size at ${\sim}920$ tokens/KB and compounds to window-overflowing totals over realistic sessions (Section~\ref{sec:eval}).
 \item We describe the \textbf{output-by-reference} pattern for agent tools and name its defining property, \textbf{Bounded Output Context Cost}: the context cost of a tool output is $O(1)$ in the size of its payload (Section~\ref{sec:pattern}).
+\item We sketch the \textbf{input-side} counterpart, arguments by reference, measure the cost of inline file arguments on real packet captures, and identify where the extension is asymmetric: who stages the bytes, and the reversed trust direction (Section~\ref{sec:input}).
 \item We give an MCP-specific \textbf{security model} for the capability-URL mechanism, including its honest bearer-token limitations and stricter variants (Section~\ref{sec:security}).
 \item We provide an open-source \textbf{reference implementation} and measurement harness (Section~\ref{sec:impl}, Appendix~\ref{app:harness}).
 \item We position the approach relative to the two adjacent literatures --- \textbf{complementary} to reactive observation management, \textbf{orthogonal} to input-side tool-advertisement reduction (Section~\ref{sec:related}).
@@ -274,6 +275,35 @@ Four findings follow.
 
 \paragraph{Session-level impact.} The per-output costs compound. A single 31~KB figure costs 27{,}702 tokens inline versus 92 \bref{} ($301\times$). A routine twelve-figure session costs approximately 332{,}000 tokens inline versus ${\sim}1{,}100$ \bref{} --- the inline total \emph{alone exceeds a 200K-token context window}, forcing truncation or a session restart, while the by-reference total is negligible. This is not hypothetical: it is the failure mode that motivated this work.
 
+\section{The Input Side: Arguments by Reference}\label{sec:input}
+
+The pattern so far concerns what a tool \emph{returns}. The same question arises for what a tool \emph{receives}: a packet-capture analyzer, an image filter, or a document parser needs a file as an argument. We sketch here how the pattern extends to tool arguments and where the extension is not symmetric; a full treatment, with measurements of upload paths, is left to future work.
+
+\paragraph{Inline input is worse than inline output.} When a tool accepts a file as an inline base64 argument --- as our own reference implementation still does for its \texttt{input\_files} parameter --- the bytes must appear in the tool call the model emits. The token rate is unchanged, but the tokens are now \emph{generated}: they are produced autoregressively, one at a time, billed at output-token rates, and bounded by the model's maximum output length. Table~\ref{tab:pcap} applies the harness of Appendix~\ref{app:harness} to real packet captures, the input of the motivating case below. Captures are not internally compressed, yet beyond a few kilobytes they tokenize at ${\sim}885$--$920$ tokens/KB, indistinguishable from the compressed formats of Table~\ref{tab:realfiles}; only small captures dominated by zero padding (a 1.4~KB DHCP exchange: 385 tokens/KB) are cheaper. A 144~KB VoIP capture would require the model to \emph{write} ${\sim}125{,}000$ tokens of base64 --- longer than many models can emit in a single response. There is a more basic problem: the model cannot transcribe bytes it has not seen. If the file exists only in the user's interface, the model has nothing to copy from; if it is already in context, transcribing it pays for the bytes twice. A model asked to supply binary it does not hold verbatim will produce plausible-looking but corrupt base64, which an integrity hash can detect but not repair.
+
+\begin{table}[htbp]\centering
+\caption{Inline cost of packet captures as base64 tool arguments (\texttt{o200k\_base}). Captures are from the Wireshark test suite and the \texttt{mcpcap} examples. As arguments, these are tokens the model must \emph{generate}.}\label{tab:pcap}
+\begin{tabular}{lrrrr}
+\toprule
+Capture & Bytes & Inline & Ref. & tok/KB \\
+\midrule
+dns.pcap                     & 4{,}338   & 3{,}456   & 105 & 816 \\
+rsasnakeoil2.pcap (TLS)      & 25{,}057  & 21{,}852  & 108 & 893 \\
+tls12-chacha20poly1305.pcap  & 43{,}693  & 39{,}117  & 115 & 917 \\
+http2-data-reassembly.pcap   & 82{,}151  & 74{,}007  & 108 & 923 \\
+sip-rtp.pcapng (VoIP)        & 144{,}300 & 125{,}033 & 101 & 887 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Arguments by reference.} The remedy mirrors Section~\ref{sec:pattern}: the argument carries a URI, optionally with the expected size and SHA-256, and the server dereferences it. The argument's context cost is then $O(1)$ in the file's size, exactly as for a returned record, and the hash lets the server reject a corrupted or substituted file before parsing it. Some servers already work this way informally. \texttt{mcpcap}~\citep{mcpcap}, an MCP server for packet analysis, takes every capture as a string that is either a local path or an \texttt{http(s)://} URL, so the model passes a short reference rather than the capture.
+
+\paragraph{Composition.} References compose across tools. A returned capability URL is itself a valid input reference: a sandbox that renders a figure or records a capture returns a URL, and the model passes that URL to the next tool, which fetches the bytes directly. The bytes travel tool to tool and never cross the model's context in either direction; the model handles only two fixed-size records. Inline transfer cannot express this chain without the model reading the bytes once and writing them again.
+
+\paragraph{Who stages the bytes.} The extension is not symmetric in one respect. On output, the server owns the bytes and can stage them before returning a reference. On input, the bytes are often held by the user --- a capture attached in a chat interface --- so the \emph{client} must stage them somewhere the server can fetch, and must hand the model a reference to the staged copy. The released MCP specification (revision 2026-07-28) defines no such client-side staging step; this is the gap that leaves a server like \texttt{mcpcap} able to accept a URL but with no standard way for a user's file to become one. The MCP File Uploads Working Group's draft extension~\citep{mcpfiles} addresses exactly this gap: a server marks file arguments in its input schema, the client uploads the bytes out of band over HTTP to a target the server supplies, and the host ``MUST NOT place file bytes'' in model context, optionally showing the model a host-defined handle that is replaced before dispatch. That handle is an input reference in the sense used here.
+
+\paragraph{The trust direction reverses.} On output, a client fetches from a server it chose to connect to. On input, a \emph{server} fetches from a URL that the model chose --- and the model's choice can be steered by injected content~\citep{greshake}. A server that dereferences arbitrary model-supplied URLs is a server-side request forgery primitive: an injected instruction can direct it at internal addresses reachable from the server's network position but not from the attacker's. \texttt{mcpcap}, for instance, fetches any \texttt{http(s)} URL it is given. Input references therefore need constraints that output references do not: accept only references issued by a trusted store (for example, capability URLs from the same deployment), or apply an allowlist; refuse addresses that are not globally reachable and do not follow redirects --- the rules the draft extension imposes on clients for server-supplied targets~\citep{mcpfiles}; and check the declared size and hash before handing the bytes to a parser, which for a format like PCAP is itself an attack surface.
+
 \section{Related Work and Positioning}\label{sec:related}
 
 This work sits at the intersection of two active lines of research, and its contribution is best understood by its relation to each.
@@ -301,9 +331,11 @@ LLM summarization   & yes, then condensed     & lossy only     & yes (summarizer
 }
 \end{table}
 
-\paragraph{Orthogonal to input-side reduction.} A parallel line reduces the context cost of \emph{tool advertisement} --- the schemas a model must see to know what tools exist. DADL's Code Mode replaces per-tool schema registration with a two-operation interface, reducing advertisement cost by a reported $142\times$ and holding it constant in catalog size~\citep{dadl}; MemTool manages tool memory dynamically across turns~\citep{memtool}. These bound the \emph{input} side of a tool call; the present work bounds the \emph{output} side. The philosophy is identical --- indirection to make context cost independent of payload size --- applied to opposite ends of the call. Output-by-reference is, in this sense, the output-side companion to Code Mode.
+\paragraph{Orthogonal to input-side reduction.} A parallel line reduces the context cost of \emph{tool advertisement} --- the schemas a model must see to know what tools exist. DADL's Code Mode replaces per-tool schema registration with a two-operation interface, reducing advertisement cost by a reported $142\times$ and holding it constant in catalog size~\citep{dadl}; MemTool manages tool memory dynamically across turns~\citep{memtool}. These bound the \emph{advertisement} side of a tool call; the present work bounds its \emph{output} side, and, in sketch, its arguments (Section~\ref{sec:input}). The philosophy is identical --- indirection to make context cost independent of payload size --- applied to opposite ends of the call. Output-by-reference is, in this sense, the output-side companion to Code Mode.
 
 \paragraph{Lineage.} The mechanism is not itself novel. Returning a lightweight reference in place of a large payload, to be redeemed from an external store, is the \textbf{Claim Check} pattern from enterprise integration~\citep{claimcheck}. Embedding an unguessable token in a URL such that possession grants access is a \textbf{capability URL}~\citep{capurls}, and is the basis of presigned object-store URLs and content-addressable storage. The contribution here is the synthesis of these for agent tool outputs, the MCP-specific security treatment (Section~\ref{sec:security}), the measurement (Section~\ref{sec:eval}), and an open reference implementation.
+
+\paragraph{Concurrent protocol work.} The MCP community has reached the same design independently. The File Uploads Working Group's draft \emph{File Uploads and Downloads Extension}~\citep{mcpfiles}, merged into the working group's experimental repository in November 2026 and not yet part of the specification, moves file bytes out of band in both directions, stating that ``files transferred out of band do not enter model context or JSON-RPC messages.'' Its download targets carry a URL, MIME type, size, an optional SHA-256 digest, and an optional expiry, and it observes that ``a URL that carries its own authorization is a secret for as long as it is valid'' --- the bearer-token property of Section~\ref{sec:security}. We read this as strong convergent evidence for the pattern, and the present work as complementary to it. The draft specifies a protocol but reports no measurement of context cost; Sections~\ref{sec:eval} and~\ref{sec:input} supply that quantitative case. It does not address the injection surface relocated into inlined metadata such as filenames (Section~\ref{sec:security}), nor routing outputs by type (Section~\ref{sec:pattern}). One design difference is substantive: the draft keeps download targets out of model context entirely, with the host fetching on the model's behalf, whereas our record exposes the URL to the model. Hiding the URL removes the model as a leakage path for the bearer credential; exposing it is what allows the model to compose tools by passing a reference from one to the next (Section~\ref{sec:input}). Which default is right likely depends on whether the deployment needs model-directed composition.
 
 \section{Discussion and Limitations}\label{sec:discussion}
 
@@ -319,7 +351,7 @@ LLM summarization   & yes, then condensed     & lossy only     & yes (summarizer
 
 \paragraph{The inline-versus-reference decision.} We use a size-and-type threshold. Is there a better policy --- one that accounts for whether the model is likely to need the bytes downstream, perhaps informed by a client-side hint about the task?
 
-\paragraph{Standardization.} Should MCP define a first-class by-reference output type, or profile its existing resource-link mechanism, with capability-URL security, TTL, and integrity-hash semantics specified? A shared convention would let clients handle referenced outputs uniformly and let servers advertise the guarantee, rather than each deployment reinventing it.
+\paragraph{Standardization.} Standardization is under way: the draft MCP file extension~\citep{mcpfiles} defines out-of-band uploads and downloads, and leaves open, among other questions, whether downloads should reuse MCP's existing resource-link mechanism and whether the integrity digest should be required. Our measurements bear on the second: a hex SHA-256 costs ${\sim}37$ tokens (measured; 30--43) of a ${\sim}100$-token record, and is the cheapest way to detect a corrupted or substituted file without ingesting it. Two further questions remain open: whether the model should see download references at all (Section~\ref{sec:related}), and how input references should be constrained against server-side request forgery when the model, rather than the host, supplies them (Section~\ref{sec:input}).
 
 \paragraph{Multimodal round-trips.} When a later step genuinely needs the bytes --- a vision model reasoning over a chart --- it fetches them on demand, paying the ingestion cost then. How does the amortized cost of fetch-on-demand compare to always-inline across realistic workloads? We expect a large win whenever the fraction of outputs actually re-consumed is small, but this deserves direct measurement.
 
@@ -327,7 +359,7 @@ LLM summarization   & yes, then condensed     & lossy only     & yes (summarizer
 
 \section{Conclusion}\label{sec:conclusion}
 
-The state of the art manages large tool outputs \emph{reactively} --- compressing or discarding them after they have entered the model's context. We have argued that a class of outputs, binary artifacts, should never enter context at all, and shown that the decades-old Claim Check pattern, realized as a URI --- a capability URL in our measured implementation --- achieves exactly this: a fixed-size metadata record replaces the payload, the bytes are retrieved on demand, and the per-output context cost becomes $O(1)$ in payload size. Measured on a representative tokenizer, this is a $301\times$ reduction for a typical figure, and it turns an artifact-heavy session from a window-overflowing liability into a non-issue --- \emph{losslessly}, since the bytes remain retrievable, and at \emph{lower} security exposure than the base64 status quo, since a bounded, self-deleting capability replaces a permanent, retained blob. The mechanism is old; its application to agent tool outputs, its security treatment, and its measurement are, to our knowledge, new. We release a reference implementation and a measurement harness, and suggest that a by-reference output convention is worth standardizing in the Model Context Protocol.
+The state of the art manages large tool outputs \emph{reactively} --- compressing or discarding them after they have entered the model's context. We have argued that a class of outputs, binary artifacts, should never enter context at all, and shown that the decades-old Claim Check pattern, realized as a URI --- a capability URL in our measured implementation --- achieves exactly this: a fixed-size metadata record replaces the payload, the bytes are retrieved on demand, and the per-output context cost becomes $O(1)$ in payload size. Measured on a representative tokenizer, this is a $301\times$ reduction for a typical figure, and it turns an artifact-heavy session from a window-overflowing liability into a non-issue --- \emph{losslessly}, since the bytes remain retrievable, and at \emph{lower} security exposure than the base64 status quo, since a bounded, self-deleting capability replaces a permanent, retained blob. The same reasoning extends to tool arguments, where inline transfer is worse still, because the model must generate the bytes, and where references compose, letting files pass from tool to tool without crossing the model's context. The mechanism is old, and the MCP community is now converging on it independently; what this work adds is the measurement of what it saves, the property that names the guarantee, and a security treatment that covers the model-facing surfaces. We release a reference implementation and a measurement harness in support of that standardization effort.
 
 \paragraph{Code and data availability.} The reference implementation (\texttt{mcp-sandbox}) is released under the Apache-2.0 license at \url{https://github.com/lemenkov/mcp-sandbox}. The measurement harness of Appendix~\ref{app:harness} (\texttt{bench/token\_cost.py}, Apache-2.0) is released together with the paper source at \url{https://github.com/lemenkov/capability-url-paper}.
 
@@ -400,8 +432,18 @@ J.~Tennison (ed.).
 
 \bibitem{mcp}
 Anthropic.
-\newblock Model Context Protocol specification.
-\newblock \url{https://modelcontextprotocol.io}, 2024.
+\newblock Model Context Protocol specification, revision 2026-07-28.
+\newblock \url{https://modelcontextprotocol.io/specification}, 2024--2026.
+
+\bibitem{mcpfiles}
+D.~Delimarsky, W.~St.~Charles, T.~Sarlandie, P.~Rodgers, K.~Van~Gent, K.~Ziemski, and M.~Eastes.
+\newblock File Uploads and Downloads Extension (\texttt{io.modelcontextprotocol/files}), Draft.
+\newblock MCP File Uploads Working Group, 2026. \url{https://github.com/modelcontextprotocol/experimental-ext-file-uploads}. Accessed 23~November~2026.
+
+\bibitem{mcpcap}
+mcpcap contributors.
+\newblock mcpcap: An MCP server for packet capture analysis.
+\newblock \url{https://github.com/mcpcap/mcpcap}. Accessed 23~November~2026.
 
 \end{thebibliography}
 
